@@ -1,0 +1,526 @@
+@mode(host.native)
+
+# loup-macos-calculator — a desktop calculator: a large right-aligned display over
+# a 4 × 6 keypad (an appkit.layout GridView of buttons). The keyboard works
+# too: the buttons' key equivalents take the digits and . + - * / % =, Escape
+# (clear) and Delete (⌫); the Calculate menu adds Return and keypad Enter (=),
+# c (clear), ⌥- (±) and ⌃L ⌃R ⌃P ⌃Q (MC MR M+ M−). Edit ▸ Copy / Paste copy
+# the display and paste a number.
+#
+# The arithmetic and the display text come from the host.dual engine in
+# calculator.loup / numformat.loup; this module only forwards key presses to
+# `press` and shows the result.
+#
+# `--self-test [png]` drives the window through its buttons, its key
+# equivalents and its menus, prints the display after each step, writes a
+# snapshot to `png` when given, then quits.
+
+from appkit.app import (appInit, run, quit, after, isSelfTest, onStandardAction, setStandardActionEnabled,
+    addMenuBefore, editMenu, menuBarMenu, Window, View, Menu, MenuItem, MOD_NONE, MOD_CONTROL, MOD_OPTION, MOD_COMMAND);
+from appkit.controls import (Label, Button, systemFont, monospacedDigitSystemFont, systemColor,
+    BEZEL_FLEXIBLE_PUSH, WEIGHT_LIGHT, TEXT_RIGHT, COLOR_SYSTEM_ORANGE, COLOR_SECONDARY_LABEL);
+from appkit.layout import (VStack, HStack, GridView, layoutNow, ALIGN_FILL, ALIGN_CENTER, ALIGN_BASELINE);
+from appkit.dialogs import (copyText, pasteText, saveClipboard, restoreClipboard, beep);
+from calculator import (Calculator, newCalculator, press, pasteNumber, isPastable, displayText, clearTitle,
+    pendingSymbol, KEY_POINT, KEY_ADD, KEY_SUBTRACT, KEY_MULTIPLY, KEY_DIVIDE, KEY_EQUALS, KEY_PERCENT,
+    KEY_SIGN, KEY_CLEAR, KEY_BACKSPACE, KEY_MEMORY_CLEAR, KEY_MEMORY_RECALL, KEY_MEMORY_ADD,
+    KEY_MEMORY_SUBTRACT);
+
+## A keypad button's size and the gaps between buttons (points).
+const KEY_WIDTH: float = 66.0;
+const KEY_HEIGHT: float = 46.0;
+const KEY_GAP: float = 8.0;
+## The display's font size; a long number is drawn smaller, down to
+## DISPLAY_MIN_SCALE × this, so it always fits the keypad's width.
+const DISPLAY_FONT_SIZE: float = 48.0;
+const DISPLAY_MIN_SCALE: float = 0.45;
+## The keyboard's keys the Calculate menu takes: Return, and the numeric
+## keypad's Enter (U+0003).
+const CHAR_RETURN: string = "\r";
+const CHAR_ENTER: string = "\u{3}";
+
+## The keypad, row by row: the button titles, the engine keys they press and
+## their key equivalents ("" for none). Escape is clear and the Delete key
+## (U+007F) is ⌫; Return, Enter (=) and the other extra keys are in the
+## Calculate menu, since a button has one key equivalent only.
+const PAD_TITLES: list[list[string]] = [
+    ["MC", "MR", "M+", "M−"],
+    ["AC", "⌫", "%", "÷"],
+    ["7", "8", "9", "×"],
+    ["4", "5", "6", "−"],
+    ["1", "2", "3", "+"],
+    ["±", "0", ".", "="]];
+const PAD_KEYS: list[list[string]] = [
+    [KEY_MEMORY_CLEAR, KEY_MEMORY_RECALL, KEY_MEMORY_ADD, KEY_MEMORY_SUBTRACT],
+    [KEY_CLEAR, KEY_BACKSPACE, KEY_PERCENT, KEY_DIVIDE],
+    ["7", "8", "9", KEY_MULTIPLY],
+    ["4", "5", "6", KEY_SUBTRACT],
+    ["1", "2", "3", KEY_ADD],
+    [KEY_SIGN, "0", KEY_POINT, KEY_EQUALS]];
+const PAD_EQUIVALENTS: list[list[string]] = [
+    ["", "", "", ""],
+    ["\u{1b}", "\u{7f}", "%", "/"],
+    ["7", "8", "9", "*"],
+    ["4", "5", "6", "-"],
+    ["1", "2", "3", "+"],
+    ["", "0", ".", "="]];
+## The keys drawn as operators (orange) and as memory keys (small, grey).
+const OPERATOR_KEYS: list[string] = [KEY_DIVIDE, KEY_MULTIPLY, KEY_SUBTRACT, KEY_ADD, KEY_EQUALS];
+const MEMORY_KEYS: list[string] = [KEY_MEMORY_CLEAR, KEY_MEMORY_RECALL, KEY_MEMORY_ADD, KEY_MEMORY_SUBTRACT];
+
+## The window and the views the app updates or the self-test reads.
+class Ui {
+    pub let win: Window;
+    pub let display: Label;
+    pub let memory_flag: Label;
+    pub let operator_flag: Label;
+    pub let clear_button: Button;
+    ## Every keypad button, row by row (the order of PAD_KEYS).
+    pub let buttons: list[Button];
+    ## The width the display's text must fit in (the keypad's width).
+    pub let display_width: float;
+
+    pub func constructor(win: Window, display: Label, memory_flag: Label, operator_flag: Label,
+        clear_button: Button, buttons: list[Button], display_width: float) {
+        this.win = win;
+        this.display = display;
+        this.memory_flag = memory_flag;
+        this.operator_flag = operator_flag;
+        this.clear_button = clear_button;
+        this.buttons = buttons;
+        this.display_width = display_width;
+    }
+}
+
+## The calculator's state, and the one Ui (in a list: a module-level value
+## must be initialised before main runs).
+var g_calc: Calculator = newCalculator();
+var g_ui: list[Ui] = [];
+
+# ── the engine ↔ the window ────────────────────────────────────────────────
+
+## Show the engine's state: the display (the label fits its font to the
+## text), the memory and pending-operator flags and the clear key's title
+## (C or AC). Edit ▸ Copy and Paste are greyed out while the display shows
+## "Error".
+func refresh(): void {
+    let ui = g_ui[0];
+    ui.display.setText(displayText(g_calc));
+    if (g_calc.has_memory) {
+        ui.memory_flag.setText("M");
+    } else {
+        ui.memory_flag.setText("");
+    }
+    ui.operator_flag.setText(pendingSymbol(g_calc));
+    ui.clear_button.setTitle(clearTitle(g_calc));
+    setStandardActionEnabled("copy:", not g_calc.error);
+    setStandardActionEnabled("paste:", not g_calc.error);
+    return;
+}
+
+## A key was pressed (a button, its key equivalent or a menu item).
+func pressKey(key: string): void {
+    global g_calc;
+    g_calc = press(g_calc, key);
+    refresh();
+    return;
+}
+
+## Run `key` when `button` is clicked. (A function of its own, so each
+## closure captures its own `key`.)
+func bindKey(button: Button, key: string): void {
+    button.onClick(func(): void { pressKey(key); });
+    return;
+}
+
+## A Calculate menu item that presses `key`, with the shortcut `equivalent`
+## and `modifiers` (MOD_NONE for the bare key).
+func addKeyItem(menu: Menu, title: string, equivalent: string, modifiers: int, key: string): MenuItem {
+    let item = menu.addItemWithModifiers(title, equivalent, modifiers, func(): void { pressKey(key); });
+    return item;
+}
+
+# ── Edit ▸ Copy / Paste ────────────────────────────────────────────────────
+#
+# The Edit menu's Copy and Paste send `copy:` / `paste:` along the responder
+# chain; with no text field in the window, the chain ends at the app delegate,
+# which `onStandardAction` makes answer them.
+
+## Edit ▸ Copy: the display's number onto the clipboard, without the
+## thousands separators, so other apps read it as a number. (refresh greys
+## the item out while the display shows "Error".)
+func copyDisplay(): void {
+    let text = displayText(g_calc).split(",").join("");
+    copyText(text);
+    return;
+}
+
+## Edit ▸ Paste: a number from the clipboard onto the display (a beep when
+## the clipboard holds no number).
+func pasteDisplay(): void {
+    global g_calc;
+    let text = pasteText();
+    if (not isPastable(text)) {
+        beep();
+        return;
+    }
+    g_calc = pasteNumber(g_calc, text);
+    refresh();
+    return;
+}
+
+# ── building the window ────────────────────────────────────────────────────
+
+## A small grey label for the flags above the display.
+func flagLabel(): Label {
+    let l = Label("");
+    l.applyFont(systemFont(15.0, false));
+    l.applyTextColor(systemColor(COLOR_SECONDARY_LABEL));
+    return l;
+}
+
+## A keypad button: its look follows its role (digit, operator, function,
+## memory). The title colors are attributed titles, which show whatever the
+## window's state (AppKit greys a bezel color out while the window is not
+## key), and follow light and dark mode.
+func keypadButton(title: string, key: string, equivalent: string): Button {
+    let b = Button(title);
+    b.setBezelStyle(BEZEL_FLEXIBLE_PUSH);
+    b.setWidth(KEY_WIDTH);
+    b.setHeight(KEY_HEIGHT);
+    if (OPERATOR_KEYS.contains(key)) {
+        b.applyFont(systemFont(26.0, false));
+        b.setTitleColor(systemColor(COLOR_SYSTEM_ORANGE));
+    } else if (MEMORY_KEYS.contains(key)) {
+        b.applyFont(systemFont(15.0, false));
+        b.setTitleColor(systemColor(COLOR_SECONDARY_LABEL));
+    } else {
+        b.applyFont(systemFont(22.0, false));
+    }
+    if (equivalent != "") {
+        b.setKeyEquivalent(equivalent);
+    }
+    return b;
+}
+
+## The Calculate menu, between Edit and Window. Its memory shortcuts are
+## Windows Calculator's (⌃L ⌃R ⌃P ⌃Q).
+func buildMenus(): void {
+    let calc = Menu("Calculate");
+    addKeyItem(calc, "Equals", CHAR_RETURN, MOD_NONE, KEY_EQUALS);
+    # A menu item has one key equivalent, so keypad Enter gets a second
+    # Equals item, hidden, whose shortcut still works.
+    calc.addHiddenItem("Equals (Enter)", CHAR_ENTER, MOD_NONE, func(): void { pressKey(KEY_EQUALS); });
+    addKeyItem(calc, "Change Sign", "-", MOD_OPTION, KEY_SIGN);
+    addKeyItem(calc, "Clear", "c", MOD_NONE, KEY_CLEAR);
+    calc.addSeparator();
+    addKeyItem(calc, "Memory Clear", "l", MOD_CONTROL, KEY_MEMORY_CLEAR);
+    addKeyItem(calc, "Memory Recall", "r", MOD_CONTROL, KEY_MEMORY_RECALL);
+    addKeyItem(calc, "Memory Add", "p", MOD_CONTROL, KEY_MEMORY_ADD);
+    addKeyItem(calc, "Memory Subtract", "q", MOD_CONTROL, KEY_MEMORY_SUBTRACT);
+    addMenuBefore(calc, "Window");
+    onStandardAction("copy:", copyDisplay);
+    onStandardAction("paste:", pasteDisplay);
+    return;
+}
+
+## The position of the engine key `key` on the keypad (an index into
+## Ui.buttons), or -1.
+func padIndex(key: string): int {
+    var index = 0;
+    for (row_keys in PAD_KEYS) {
+        for (k in row_keys) {
+            if (k == key) {
+                return index;
+            }
+            index = index + 1;
+        }
+    }
+    return -1;
+}
+
+func buildUi(): Ui {
+    # A placeholder size: the window is fitted to its content below.
+    let win = Window("Calculator", 300.0, 400.0);
+    win.setResizable(false);
+
+    # Flags (memory on the left, the pending operator on the right) over the
+    # display.
+    let memory_flag = flagLabel();
+    let operator_flag = flagLabel();
+    let flags = HStack();
+    flags.setAlignment(ALIGN_BASELINE);
+    flags.add(memory_flag);
+    flags.addSpacer();
+    flags.add(operator_flag);
+
+    # The light system font with fixed-width digits (the display does not
+    # jiggle as digits change), shrunk to fit the keypad's width.
+    let display_width = KEY_WIDTH * 4.0 + KEY_GAP * 3.0;
+    let display = Label("0");
+    display.applyFont(monospacedDigitSystemFont(DISPLAY_FONT_SIZE, WEIGHT_LIGHT));
+    display.setAlignment(TEXT_RIGHT);
+    display.setShrinkToFit(display_width, DISPLAY_MIN_SCALE);
+
+    let grid = GridView();
+    grid.setRowSpacing(KEY_GAP);
+    grid.setColumnSpacing(KEY_GAP);
+    var buttons: list[Button] = [];
+    var row = 0;
+    while (row < PAD_TITLES.len()) {
+        let row_titles = PAD_TITLES[row];
+        let row_keys = PAD_KEYS[row];
+        let row_equivalents = PAD_EQUIVALENTS[row];
+        var cells: list[View] = [];
+        var col = 0;
+        while (col < row_titles.len()) {
+            let key = row_keys[col];
+            let b = keypadButton(row_titles[col], key, row_equivalents[col]);
+            bindKey(b, key);
+            cells.push(b);
+            buttons.push(b);
+            col = col + 1;
+        }
+        grid.addRow(cells);
+        row = row + 1;
+    }
+    let clear_button = buttons[padIndex(KEY_CLEAR)];
+
+    let root = VStack();
+    root.setInsets(18.0, 18.0, 18.0, 18.0);
+    root.setSpacing(4.0);
+    root.setAlignment(ALIGN_FILL);
+    root.add(flags);
+    # The slack a smaller display font leaves goes above the display, so the
+    # number stays just over the keypad and the keypad never moves.
+    root.addSpacer();
+    root.add(display);
+    root.setSpacingAfter(display, 14.0);
+    let pad = HStack();
+    pad.setAlignment(ALIGN_CENTER);
+    pad.add(grid);
+    root.add(pad);
+    win.setContent(root);
+    win.fitToContent();
+    win.center();
+
+    let ui = Ui(win, display, memory_flag, operator_flag, clear_button, buttons, display_width);
+    return ui;
+}
+
+# ── the self-test ──────────────────────────────────────────────────────────
+
+## The button whose title is `title` now, read from the buttons themselves.
+## The clear key is found by its current title, "C" or "AC", so a sequence
+## also checks that the title switched.
+func buttonTitled(ui: Ui, title: string): Button {
+    for (b in ui.buttons) {
+        if (b.title() == title) {
+            return b;
+        }
+    }
+    if (title == "C" or title == "AC") {
+        throw ValueError("self-test: the clear key shows '" + ui.clear_button.title() + "', not '"
+            + title + "'");
+    }
+    throw ValueError("self-test: no button titled '" + title + "'");
+}
+
+## Check that the display's text fits the keypad's width in the font the
+## label fitted to it (a longer number would be cut off).
+func checkDisplayFits(ui: Ui): void {
+    let needed = ui.display.textWidth();
+    if (needed > ui.display_width) {
+        throw ValueError("self-test: '" + ui.display.text() + "' needs " + needed.to_string()
+            + " points, the display has " + ui.display_width.to_string());
+    }
+    return;
+}
+
+## Click the buttons of `token`: a button title ("×", "M+", "AC") or a number
+## typed digit by digit ("12.5").
+func clickToken(ui: Ui, token: string): void {
+    if (not isNumberToken(token)) {
+        buttonTitled(ui, token).click();
+        return;
+    }
+    var i = 0;
+    while (i < token.len()) {
+        buttonTitled(ui, token.substring(i, i + 1)).click();
+        i = i + 1;
+    }
+    return;
+}
+
+## Whether `token` is made of digits and points only.
+func isNumberToken(token: string): bool {
+    var i = 0;
+    while (i < token.len()) {
+        let c = token.substring(i, i + 1);
+        if (not "0123456789.".contains(c)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return token.len() > 0;
+}
+
+## Click through `sequence` (tokens separated by spaces) and print the
+## display after each token, read back from the display label.
+func clickSequence(ui: Ui, sequence: string): void {
+    var shown: list[string] = [];
+    for (token in sequence.split(" ")) {
+        clickToken(ui, token);
+        checkDisplayFits(ui);
+        shown.push(ui.display.text());
+    }
+    println(sequence + "  ->  " + shown.join(" | "));
+    return;
+}
+
+## The window's state as one line: the flags, the display and the clear
+## key's title.
+func state(ui: Ui): string {
+    let line = "[" + ui.memory_flag.text() + "|" + ui.operator_flag.text() + "] "
+        + ui.display.text() + "  (" + ui.clear_button.title() + ")";
+    return line;
+}
+
+## Press each key of `keys` with `modifiers` held, as the keyboard would (the
+## window offers each to its buttons' key equivalents, then the menu bar to
+## its items'), and print the window's state after them (`label` names the
+## keys in the output).
+func typeKeys(ui: Ui, label: string, keys: list[string], modifiers: int): void {
+    for (k in keys) {
+        if (not ui.win.sendKey(k, modifiers)) {
+            println("not handled: " + label);
+        }
+    }
+    println("typed " + label + "  ->  " + state(ui));
+    return;
+}
+
+## Choose Edit ▸ `title` as a click on it would; whether it was sent (false
+## while the item is greyed out).
+func chooseEditItem(title: string): bool {
+    let sent = editMenu().itemWithTitle(title).perform();
+    return sent;
+}
+
+func selfTest(ui: Ui): void {
+    layoutNow(ui.win.content());
+    println("start: " + state(ui));
+
+    println("-- buttons");
+    clickSequence(ui, "12.5 × 4 =");
+    clickSequence(ui, "AC 1 ÷ 3 × 3 =");
+    clickSequence(ui, "AC 0.1 + 0.2 =");
+    clickSequence(ui, "AC 2 + 3 = = =");
+    clickSequence(ui, "AC 7 ÷ 0 =");
+    clickSequence(ui, "5 + =");
+    println("after 7 ÷ 0: " + state(ui));
+    clickSequence(ui, "AC");
+    println("after AC: " + state(ui));
+    clickSequence(ui, "50 + 10 % =");
+    clickSequence(ui, "AC 200 − 15 % =");
+    clickSequence(ui, "AC 25 ± × 4 =");
+    clickSequence(ui, "± ±");
+    clickSequence(ui, "AC 9 − ± 4 =");
+    clickSequence(ui, "AC 123 ⌫ ⌫ 9");
+    clickSequence(ui, "C AC 1234567 × 1000 =");
+    clickSequence(ui, "AC 999999 × 999999 × 1000 =");
+    clickSequence(ui, "AC 1 ÷ 3000000 =");
+    clickSequence(ui, "AC 2 ÷ 3 ± ÷ 999999999999 = = = = = = = = =");
+
+    println("-- clear entry");
+    clickSequence(ui, "AC 5 + 3");
+    println("typing: " + state(ui));
+    clickSequence(ui, "C");
+    println("entry cleared: " + state(ui));
+    clickSequence(ui, "2 =");
+    clickSequence(ui, "AC");
+    println("all cleared: " + state(ui));
+
+    println("-- memory");
+    clickSequence(ui, "12 M+");
+    println("stored: " + state(ui));
+    clickSequence(ui, "3 M+ 5 M−");
+    clickSequence(ui, "AC MR");
+    clickSequence(ui, "× MR =");
+    println("recalled: " + state(ui));
+    clickSequence(ui, "MC");
+    println("memory cleared: " + state(ui));
+
+    println("-- keyboard");
+    clickSequence(ui, "AC");
+    typeKeys(ui, "9 * 9 Return", ["9", "*", "9", CHAR_RETURN], MOD_NONE);
+    typeKeys(ui, "= =", ["=", "="], MOD_NONE);
+    typeKeys(ui, "Escape", ["\u{1b}"], MOD_NONE);
+    typeKeys(ui, "4 2 . 5 Delete / 2 =", ["4", "2", ".", "5", "\u{7f}", "/", "2", "="], MOD_NONE);
+    typeKeys(ui, "Option-minus", ["-"], MOD_OPTION);
+    typeKeys(ui, "Control-P", ["p"], MOD_CONTROL);
+    typeKeys(ui, "c c", ["c", "c"], MOD_NONE);
+    typeKeys(ui, "Control-R", ["r"], MOD_CONTROL);
+    typeKeys(ui, "Control-Q", ["q"], MOD_CONTROL);
+    typeKeys(ui, "Control-R", ["r"], MOD_CONTROL);
+    typeKeys(ui, "Control-L", ["l"], MOD_CONTROL);
+    typeKeys(ui, "5 0 %", ["5", "0", "%"], MOD_NONE);
+    typeKeys(ui, "+ 3 Enter", ["+", "3", CHAR_ENTER], MOD_NONE);
+    let enter = menuBarMenu("Calculate").itemWithTitle("Equals (Enter)");
+    println("Equals (Enter) item: hidden " + enter.isHidden().to_string() + ", shortcut when hidden "
+        + enter.allowsKeyEquivalentWhenHidden().to_string());
+
+    println("-- copy and paste");
+    let saved = saveClipboard();
+    clickSequence(ui, "AC 1234 × 2 =");
+    copyText("(nothing copied)");
+    chooseEditItem("Copy");
+    println("copied: " + pasteText());
+    copyText("-0.75");
+    chooseEditItem("Paste");
+    println("pasted -0.75: " + state(ui));
+    clickSequence(ui, "× 4 =");
+    copyText("not a number");
+    chooseEditItem("Paste");
+    println("pasted text: " + state(ui));
+    copyText("1,000");
+    typeKeys(ui, "Command-V (1,000)", ["v"], MOD_COMMAND);
+    copyText("(nothing copied)");
+    typeKeys(ui, "Command-C", ["c"], MOD_COMMAND);
+    println("copied: " + pasteText());
+    clickSequence(ui, "AC 1 ÷ 0 =");
+    copyText("(nothing copied)");
+    let sent = chooseEditItem("Copy");
+    println("Copy while showing Error: sent " + sent.to_string() + ", enabled "
+        + editMenu().itemWithTitle("Copy").isEnabled().to_string() + "; clipboard: " + pasteText());
+    restoreClipboard(saved);
+
+    clickSequence(ui, "AC 3.14159 × 2 = M+ ×");
+    println("final: " + state(ui));
+    let argv = runtime.args();
+    if (argv.len() > 1) {
+        ui.win.snapshot(argv[1]);
+    }
+    println("window: " + ui.win.title() + ", resizable " + ui.win.isResizable().to_string());
+    quit();
+    return;
+}
+
+## The self-test timer's handler. (appkit ends a self-test with exit status 1
+## when a handler throws, so a failing step cannot leave the app running.)
+func runSelfTest(): void {
+    selfTest(g_ui[0]);
+    return;
+}
+
+pub func main(): void {
+    appInit("Calculator");
+    buildMenus();
+    let ui = buildUi();
+    g_ui.push(ui);
+    refresh();
+    if (isSelfTest()) {
+        after(0.3, runSelfTest);
+    }
+    run(ui.win);
+}

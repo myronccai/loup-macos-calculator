@@ -1,0 +1,5 @@
+/.temp/
+/.loup-cache/
+/loup-macos-calculator
+*.loupbuild.fp
+.DS_Store

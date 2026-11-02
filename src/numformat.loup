@@ -1,0 +1,339 @@
+@mode(host.dual)
+
+# numformat — the calculator's numbers as text, and text as numbers.
+#
+# The calculator computes in binary floating point (`float`, an IEEE double),
+# whose results carry noise in the last bits: 0.1 + 0.2 is
+# 0.30000000000000004. Two things keep that noise off the display:
+#
+#   * `normalize` rounds every computed result to STORED_DIGITS (15)
+#     significant decimal digits and turns it back into the nearest double,
+#     so 0.1 + 0.2 is stored as exactly the double that "0.3" parses to and
+#     0.3 − (0.1 + 0.2) is 0, not 5.55e-17.
+#   * `formatNumber` shows at most DISPLAY_DIGITS (12) significant digits, so
+#     1 ÷ 3 × 3 (0.999999999999999 after normalizing) reads "1". Scientific
+#     notation keeps all 12 ("9.99998000001e14"), so it never shows less than
+#     plain notation would.
+#
+# Digits are extracted with integer arithmetic only (no float-to-string
+# conversion), so the interpreters and both native drivers print the same
+# text for the same value.
+
+## Significant digits kept in a stored result (a double holds 15 exactly).
+pub const STORED_DIGITS: int = 15;
+## Significant digits shown on the display (and the most a user can type).
+pub const DISPLAY_DIGITS: int = 12;
+## Plain notation is used for exponents from MIN_PLAIN_EXPONENT (0.000001…)
+## up to DISPLAY_DIGITS - 1 (999,999,999,999); others are scientific.
+const MIN_PLAIN_EXPONENT: int = -6;
+## The largest finite double.
+const MAX_DOUBLE: float = 1.7976931348623157e308;
+
+## A positive number rounded to a fixed count of significant digits:
+## `mantissa` has exactly that many digits and the value is
+## mantissa × 10^(exponent − digits + 1), i.e. `exponent` is the power of ten
+## of the first digit.
+pub struct Rounded {
+    pub mantissa: int;
+    pub exponent: int;
+}
+
+## Whether `v` is an ordinary number (not infinite, not NaN).
+pub func isFinite(v: float): bool {
+    let finite = v == v and v <= MAX_DOUBLE and v >= -MAX_DOUBLE;
+    return finite;
+}
+
+## 10^n as an integer (0 <= n <= 18).
+func pow10Int(n: int): int {
+    var p = 1;
+    var i = 0;
+    while (i < n) {
+        p = p * 10;
+        i = i + 1;
+    }
+    return p;
+}
+
+## 10^n as a float (n >= 0); exact up to 10^22.
+func pow10(n: int): float {
+    var p = 1.0;
+    var i = 0;
+    while (i < n) {
+        p = p * 10.0;
+        i = i + 1;
+    }
+    return p;
+}
+
+## `a` × 10^k for any k. Large shifts go in two steps so 10^k itself never
+## overflows (a denormal times 10^320 is an ordinary number).
+func shift(a: float, k: int): float {
+    if (k > 300) {
+        let partial = a * pow10(300);
+        let shifted = partial * pow10(k - 300);
+        return shifted;
+    }
+    if (k < -300) {
+        let partial = a / pow10(300);
+        let shifted = partial / pow10(-k - 300);
+        return shifted;
+    }
+    if (k >= 0) {
+        let shifted = a * pow10(k);
+        return shifted;
+    }
+    let shifted = a / pow10(-k);
+    return shifted;
+}
+
+## The power of ten of the first significant digit of `a` (> 0): 2 for 123,
+## -1 for 0.5. May be one off when `a` is a hair below a power of ten;
+## `roundSignificant` corrects for that.
+func decimalExponent(a: float): int {
+    var e = 0;
+    var x = a;
+    while (x >= 10.0) {
+        x = x / 10.0;
+        e = e + 1;
+    }
+    while (x < 1.0) {
+        x = x * 10.0;
+        e = e - 1;
+    }
+    return e;
+}
+
+## `a` (> 0, finite) rounded half-up to `digits` significant digits
+## (1 <= digits <= 17).
+pub func roundSignificant(a: float, digits: int): Rounded {
+    var e = decimalExponent(a);
+    var scaled = shift(a, digits - 1 - e);
+    var m = (scaled + 0.5) as int;
+    if (m < pow10Int(digits - 1)) {
+        # The exponent guess was one too high: take one more digit.
+        e = e - 1;
+        scaled = shift(a, digits - 1 - e);
+        m = (scaled + 0.5) as int;
+    }
+    if (m >= pow10Int(digits)) {
+        # Rounding carried into a new digit (9.99…5 → 10.0…).
+        m = m / 10;
+        e = e + 1;
+    }
+    let r = Rounded(mantissa = m, exponent = e);
+    return r;
+}
+
+## `v` rounded to STORED_DIGITS significant digits (the nearest double to
+## that decimal). Zero, infinities and NaN come back unchanged.
+pub func normalize(v: float): float {
+    if (v == 0.0 or not isFinite(v)) {
+        return v;
+    }
+    var a = v;
+    if (v < 0.0) {
+        a = 0.0 - v;
+    }
+    let r = roundSignificant(a, STORED_DIGITS);
+    # mantissa × 10^k: a division by an exact power of ten rounds once, to
+    # the double nearest the decimal value.
+    let k = r.exponent - STORED_DIGITS + 1;
+    let magnitude = shift(r.mantissa as float, k);
+    if (v < 0.0) {
+        let negative = 0.0 - magnitude;
+        return negative;
+    }
+    return magnitude;
+}
+
+## `digits` (a run of decimal digits) with a comma between each group of
+## three, counted from the right: "1234567" → "1,234,567".
+pub func groupThousands(digits: string): string {
+    let n = digits.len();
+    var out = "";
+    var i = 0;
+    while (i < n) {
+        if (i > 0 and (n - i) % 3 == 0) {
+            out = out + ",";
+        }
+        out = out + digits.substring(i, i + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+## `text` without its trailing "0" characters.
+func stripTrailingZeros(text: string): string {
+    var end = text.len();
+    while (end > 0 and text.substring(end - 1, end) == "0") {
+        end = end - 1;
+    }
+    let stripped = text.substring(0, end);
+    return stripped;
+}
+
+## "0" repeated `count` times.
+func zeros(count: int): string {
+    var out = "";
+    var i = 0;
+    while (i < count) {
+        out = out + "0";
+        i = i + 1;
+    }
+    return out;
+}
+
+## A positive number rounded to DISPLAY_DIGITS (`r`) in scientific notation:
+## "1.23456789012e15", "3.33333333333e-7", "1e12".
+func formatScientific(r: Rounded): string {
+    let digits = r.mantissa.to_string();
+    let fraction = stripTrailingZeros(digits.substring(1, digits.len()));
+    var text = digits.substring(0, 1);
+    if (fraction.len() > 0) {
+        text = text + "." + fraction;
+    }
+    text = text + "e" + r.exponent.to_string();
+    return text;
+}
+
+## Positive `a` in plain notation with at most DISPLAY_DIGITS digits, the
+## zeros after the point of a small number included: "1,234.5",
+## "0.333333333333", "0.000123456789".
+func formatPlain(a: float, exponent: int): string {
+    var significant = DISPLAY_DIGITS;
+    if (exponent < 0) {
+        significant = DISPLAY_DIGITS + exponent + 1;
+    }
+    let r = roundSignificant(a, significant);
+    let digits = r.mantissa.to_string();
+    var whole = "0";
+    var fraction = "";
+    if (r.exponent >= 0) {
+        whole = digits.substring(0, r.exponent + 1);
+        fraction = digits.substring(r.exponent + 1, digits.len());
+    } else {
+        fraction = zeros(0 - r.exponent - 1) + digits;
+    }
+    fraction = stripTrailingZeros(fraction);
+    var text = groupThousands(whole);
+    if (fraction.len() > 0) {
+        text = text + "." + fraction;
+    }
+    return text;
+}
+
+## `v` as the calculator shows a result: at most 12 significant digits, no
+## trailing zeros, thousands grouped ("1,234,567.89"), scientific notation
+## for very large or very small magnitudes ("1.5e20"); "Error" for an
+## infinite or NaN value.
+pub func formatNumber(v: float): string {
+    if (not isFinite(v)) {
+        return "Error";
+    }
+    if (v == 0.0) {
+        return "0";
+    }
+    var a = v;
+    var sign = "";
+    if (v < 0.0) {
+        a = 0.0 - v;
+        sign = "-";
+    }
+    let r = roundSignificant(a, DISPLAY_DIGITS);
+    var body = "";
+    if (r.exponent >= DISPLAY_DIGITS or r.exponent < MIN_PLAIN_EXPONENT) {
+        body = formatScientific(r);
+    } else {
+        body = formatPlain(a, r.exponent);
+    }
+    let text = sign + body;
+    return text;
+}
+
+## The value of the one-character digit `c` ("0" … "9"), or -1 when `c` is
+## not a digit.
+pub func digitValue(c: string): int {
+    let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    var i = 0;
+    while (i < 10) {
+        if (c == digits[i]) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+## How many digits (0-9) `entry` holds.
+pub func digitCount(entry: string): int {
+    var count = 0;
+    var i = 0;
+    while (i < entry.len()) {
+        let c = entry.substring(i, i + 1);
+        if (c != "." and c != "-") {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+## A number being typed ("-1234.50", "0.") as the display shows it: the whole
+## part grouped, the fraction exactly as typed ("-1,234.50", "0.").
+pub func formatEntry(entry: string): string {
+    var sign = "";
+    var body = entry;
+    if (entry.startsWith("-")) {
+        sign = "-";
+        body = entry.substring(1, entry.len());
+    }
+    var whole = body;
+    var rest = "";
+    var i = 0;
+    while (i < body.len()) {
+        if (body.substring(i, i + 1) == ".") {
+            whole = body.substring(0, i);
+            rest = body.substring(i, body.len());
+            break;
+        }
+        i = i + 1;
+    }
+    let text = sign + groupThousands(whole) + rest;
+    return text;
+}
+
+## The value of a typed number: an optional "-", digits, and at most one ".".
+## Throws ValueError for anything else.
+pub func parseEntry(entry: string): float {
+    var negative = false;
+    var mantissa = 0;
+    var fraction_digits = 0;
+    var seen_point = false;
+    var i = 0;
+    while (i < entry.len()) {
+        let c = entry.substring(i, i + 1);
+        if (c == "-" and i == 0) {
+            negative = true;
+        } else if (c == "." and not seen_point) {
+            seen_point = true;
+        } else {
+            let d = digitValue(c);
+            if (d < 0) {
+                throw ValueError("numformat.parseEntry: not a number: '" + entry + "'");
+            }
+            mantissa = mantissa * 10 + d;
+            if (seen_point) {
+                fraction_digits = fraction_digits + 1;
+            }
+        }
+        i = i + 1;
+    }
+    # mantissa has at most DISPLAY_DIGITS digits, so it and 10^fraction are
+    # exact doubles and the division rounds once.
+    var value = (mantissa as float) / pow10(fraction_digits);
+    if (negative) {
+        value = 0.0 - value;
+    }
+    return value;
+}

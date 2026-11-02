@@ -1,0 +1,475 @@
+@mode(host.dual)
+
+# calculator — the calculator engine: a state machine driven by key presses,
+# with no AppKit in it (the window in main.lphc only forwards keys and shows
+# `displayText`).
+#
+# The state is a struct, a value: `press(state, key)` returns the next state
+# and leaves its argument as it was, so the UI keeps one current state and
+# the tests can step through states freely.
+#
+# Arithmetic is immediate-execution, like a pocket calculator: `2 + 3 × 4 =`
+# is (2 + 3) × 4 = 20. Behaviour in detail:
+#
+#   digits, "."    type a number of at most 12 digits ("." once; a leading
+#                  "." types "0.").
+#   + − × ÷        apply the pending operator to the accumulator and the
+#                  number on display, then wait for the next operand.
+#                  Pressing another operator before typing replaces it.
+#   =              finish the pending operation. With nothing pending it
+#                  repeats the last one with the same right operand
+#                  (2 + 3 = = = shows 5, 8, 11). `5 + =` is 5 + 5.
+#   %              after + or −: that percent of the accumulator
+#                  (50 + 10 % → 5, so = gives 55); otherwise ÷ 100.
+#   ±              changes the sign of the number on display (typing
+#                  continues); right after an operator it starts "-0".
+#   C / AC         the clear key: "C" while typing clears the entry only;
+#                  otherwise "AC" clears everything but the memory.
+#   ⌫              deletes the last typed character.
+#   MC MR M+ M−    clear, recall, add to, subtract from the memory.
+#
+# `pasteNumber` puts a number from the clipboard on the display (as MR does).
+#
+# A division by zero (or an overflow) shows "Error"; every key but the clear
+# key is then ignored until it is pressed.
+
+from numformat import (normalize, isFinite, formatNumber, formatEntry, parseEntry, digitCount,
+    digitValue, DISPLAY_DIGITS, STORED_DIGITS);
+
+## The keys `press` accepts (besides the digits "0" … "9").
+pub const KEY_POINT: string = ".";
+pub const KEY_ADD: string = "+";
+pub const KEY_SUBTRACT: string = "-";
+pub const KEY_MULTIPLY: string = "*";
+pub const KEY_DIVIDE: string = "/";
+pub const KEY_EQUALS: string = "=";
+pub const KEY_PERCENT: string = "%";
+pub const KEY_SIGN: string = "+/-";
+pub const KEY_CLEAR: string = "clear";
+pub const KEY_BACKSPACE: string = "back";
+pub const KEY_MEMORY_CLEAR: string = "MC";
+pub const KEY_MEMORY_RECALL: string = "MR";
+pub const KEY_MEMORY_ADD: string = "M+";
+pub const KEY_MEMORY_SUBTRACT: string = "M-";
+
+## Everything the calculator remembers between key presses.
+pub struct Calculator {
+    ## The number on display when nothing is being typed (a result, a
+    ## recalled memory, a percentage).
+    pub var value: float;
+    ## The number being typed, as typed ("12.50", "-0."); "" when not typing.
+    pub var entry: string;
+    ## The left operand of the pending operation.
+    pub var accumulator: float;
+    ## The pending operator (KEY_ADD … KEY_DIVIDE), or "" when none.
+    pub var pending: string;
+    ## Whether the display holds a new right operand for `pending` (typed or
+    ## recalled since the operator was pressed).
+    pub var operand_ready: bool;
+    ## The operator and right operand `=` repeats.
+    pub var last_operator: string;
+    pub var last_operand: float;
+    ## The memory register, and whether anything is stored in it.
+    pub var memory: float;
+    pub var has_memory: bool;
+    ## Whether the display shows "Error".
+    pub var error: bool;
+}
+
+## A calculator showing 0 with nothing pending and an empty memory.
+pub func newCalculator(): Calculator {
+    let c = Calculator(value = 0.0, entry = "", accumulator = 0.0, pending = "",
+        operand_ready = false, last_operator = "", last_operand = 0.0, memory = 0.0,
+        has_memory = false, error = false);
+    return c;
+}
+
+## The text on the display.
+pub func displayText(c: Calculator): string {
+    if (c.error) {
+        return "Error";
+    }
+    if (c.entry != "") {
+        let typed = formatEntry(c.entry);
+        return typed;
+    }
+    let shown = formatNumber(c.value);
+    return shown;
+}
+
+## The number on display (the typed one while typing).
+pub func displayValue(c: Calculator): float {
+    if (c.entry != "") {
+        let typed = parseEntry(c.entry);
+        return typed;
+    }
+    return c.value;
+}
+
+## The clear key's title: "C" while a number is being typed (it clears just
+## that), "AC" otherwise (it clears everything).
+pub func clearTitle(c: Calculator): string {
+    if (c.entry != "" and not c.error) {
+        return "C";
+    }
+    return "AC";
+}
+
+## The pending operator as the keypad shows it ("+", "−", "×", "÷"), or "".
+pub func pendingSymbol(c: Calculator): string {
+    let symbol = operatorSymbol(c.pending);
+    return symbol;
+}
+
+## The keypad symbol of an operator key ("" for anything else).
+pub func operatorSymbol(key: string): string {
+    if (key == KEY_ADD) {
+        return "+";
+    }
+    if (key == KEY_SUBTRACT) {
+        return "−";
+    }
+    if (key == KEY_MULTIPLY) {
+        return "×";
+    }
+    if (key == KEY_DIVIDE) {
+        return "÷";
+    }
+    return "";
+}
+
+func isOperator(key: string): bool {
+    let op = key == KEY_ADD or key == KEY_SUBTRACT or key == KEY_MULTIPLY or key == KEY_DIVIDE;
+    return op;
+}
+
+## `a op b`, unrounded (an infinity or NaN for a division by zero).
+func apply(a: float, op: string, b: float): float {
+    if (op == KEY_ADD) {
+        let sum = a + b;
+        return sum;
+    }
+    if (op == KEY_SUBTRACT) {
+        let difference = a - b;
+        return difference;
+    }
+    if (op == KEY_MULTIPLY) {
+        let product = a * b;
+        return product;
+    }
+    if (op == KEY_DIVIDE) {
+        if (b == 0.0) {
+            let undefined = 0.0 / 0.0;
+            return undefined;
+        }
+        let quotient = a / b;
+        return quotient;
+    }
+    throw ValueError("calculator: not an operator: '" + op + "'");
+}
+
+## `c` showing the result `r` (rounded to the stored precision), or "Error"
+## when `r` is not a finite number.
+func showResult(c: Calculator, r: float): Calculator {
+    var n = c;
+    n.entry = "";
+    if (not isFinite(r)) {
+        n = errorState(c);
+        return n;
+    }
+    var v = normalize(r);
+    if (v == 0.0) {
+        # No "-0" result.
+        v = 0.0;
+    }
+    n.value = v;
+    return n;
+}
+
+## `c` showing "Error": nothing pending, nothing typed; the memory is kept.
+func errorState(c: Calculator): Calculator {
+    var n = newCalculator();
+    n.memory = c.memory;
+    n.has_memory = c.has_memory;
+    n.error = true;
+    return n;
+}
+
+func pressDigit(c: Calculator, key: string): Calculator {
+    var n = c;
+    n.operand_ready = true;
+    if (c.entry == "") {
+        n.entry = key;
+        return n;
+    }
+    if (digitCount(c.entry) >= DISPLAY_DIGITS) {
+        return c;
+    }
+    if (c.entry == "0") {
+        n.entry = key;
+    } else if (c.entry == "-0") {
+        n.entry = "-" + key;
+    } else {
+        n.entry = c.entry + key;
+    }
+    return n;
+}
+
+func pressPoint(c: Calculator): Calculator {
+    var n = c;
+    n.operand_ready = true;
+    if (c.entry == "") {
+        n.entry = "0.";
+    } else if (not c.entry.contains(".")) {
+        n.entry = c.entry + ".";
+    }
+    return n;
+}
+
+func pressOperator(c: Calculator, key: string): Calculator {
+    var n = c;
+    if (c.pending != "" and c.operand_ready) {
+        n = showResult(c, apply(c.accumulator, c.pending, displayValue(c)));
+        if (n.error) {
+            return n;
+        }
+        n.accumulator = n.value;
+    } else if (c.pending == "") {
+        n.value = displayValue(c);
+        n.accumulator = n.value;
+    }
+    # Otherwise an operator was just pressed: this one replaces it.
+    n.entry = "";
+    n.pending = key;
+    n.operand_ready = false;
+    return n;
+}
+
+func pressEquals(c: Calculator): Calculator {
+    var n = c;
+    if (c.pending != "") {
+        let operand = displayValue(c);
+        n = showResult(c, apply(c.accumulator, c.pending, operand));
+        if (n.error) {
+            return n;
+        }
+        n.last_operator = c.pending;
+        n.last_operand = operand;
+        n.pending = "";
+    } else if (c.last_operator != "") {
+        n = showResult(c, apply(displayValue(c), c.last_operator, c.last_operand));
+        if (n.error) {
+            return n;
+        }
+    } else {
+        n = showResult(c, displayValue(c));
+    }
+    n.accumulator = n.value;
+    n.operand_ready = false;
+    return n;
+}
+
+func pressPercent(c: Calculator): Calculator {
+    let x = displayValue(c);
+    var r = x / 100.0;
+    if (c.pending == KEY_ADD or c.pending == KEY_SUBTRACT) {
+        r = c.accumulator * x / 100.0;
+    }
+    var n = showResult(c, r);
+    n.operand_ready = true;
+    return n;
+}
+
+func pressSign(c: Calculator): Calculator {
+    var n = c;
+    if (c.entry != "") {
+        if (c.entry.startsWith("-")) {
+            n.entry = c.entry.substring(1, c.entry.len());
+        } else {
+            n.entry = "-" + c.entry;
+        }
+        return n;
+    }
+    if (c.pending != "" and not c.operand_ready) {
+        # Start typing a negative right operand.
+        n.entry = "-0";
+        n.operand_ready = true;
+        return n;
+    }
+    n.value = 0.0 - c.value;
+    if (n.value == 0.0) {
+        n.value = 0.0;
+    }
+    return n;
+}
+
+func pressClear(c: Calculator): Calculator {
+    if (c.entry != "" and not c.error) {
+        # "C": forget the typed number only; the pending operation stays.
+        var n = c;
+        n.entry = "";
+        n.value = 0.0;
+        return n;
+    }
+    # "AC": everything but the memory.
+    var cleared = newCalculator();
+    cleared.memory = c.memory;
+    cleared.has_memory = c.has_memory;
+    return cleared;
+}
+
+func pressBackspace(c: Calculator): Calculator {
+    if (c.entry == "") {
+        return c;
+    }
+    var n = c;
+    var shorter = c.entry.substring(0, c.entry.len() - 1);
+    if (shorter == "" or shorter == "-") {
+        shorter = "0";
+    }
+    n.entry = shorter;
+    return n;
+}
+
+## `c` after a memory key; the number on display stops being typed (the next
+## digit starts a new number) but stays usable as an operand.
+func pressMemory(c: Calculator, key: string): Calculator {
+    var n = c;
+    if (key == KEY_MEMORY_CLEAR) {
+        n.memory = 0.0;
+        n.has_memory = false;
+        return n;
+    }
+    if (key == KEY_MEMORY_RECALL) {
+        n.entry = "";
+        n.value = c.memory;
+        n.operand_ready = true;
+        return n;
+    }
+    let x = displayValue(c);
+    var m = c.memory + x;
+    if (key == KEY_MEMORY_SUBTRACT) {
+        m = c.memory - x;
+    }
+    if (not isFinite(m)) {
+        n = errorState(c);
+        return n;
+    }
+    n.memory = normalize(m);
+    n.has_memory = true;
+    n.entry = "";
+    n.value = x;
+    return n;
+}
+
+## Whether `key` is one `press` accepts.
+pub func isKey(key: string): bool {
+    if (digitValue(key) >= 0 or isOperator(key)) {
+        return true;
+    }
+    let others = [KEY_POINT, KEY_EQUALS, KEY_PERCENT, KEY_SIGN, KEY_CLEAR, KEY_BACKSPACE,
+        KEY_MEMORY_CLEAR, KEY_MEMORY_RECALL, KEY_MEMORY_ADD, KEY_MEMORY_SUBTRACT];
+    let known = others.contains(key);
+    return known;
+}
+
+## The state after pressing `key` (a digit or one of the KEY_* constants).
+## Throws ValueError for an unknown key.
+pub func press(c: Calculator, key: string): Calculator {
+    if (not isKey(key)) {
+        throw ValueError("calculator.press: unknown key '" + key + "'");
+    }
+    if (key == KEY_CLEAR) {
+        let cleared = pressClear(c);
+        return cleared;
+    }
+    if (c.error) {
+        # Only the clear key leaves the error state.
+        return c;
+    }
+    var n = c;
+    if (digitValue(key) >= 0) {
+        n = pressDigit(c, key);
+    } else if (key == KEY_POINT) {
+        n = pressPoint(c);
+    } else if (isOperator(key)) {
+        n = pressOperator(c, key);
+    } else if (key == KEY_EQUALS) {
+        n = pressEquals(c);
+    } else if (key == KEY_PERCENT) {
+        n = pressPercent(c);
+    } else if (key == KEY_SIGN) {
+        n = pressSign(c);
+    } else if (key == KEY_BACKSPACE) {
+        n = pressBackspace(c);
+    } else {
+        n = pressMemory(c, key);
+    }
+    return n;
+}
+
+## `text` without the characters a copied number may carry around or inside
+## it: thousands separators, spaces, tabs and line breaks.
+func cleanPasted(text: string): string {
+    var out = "";
+    var i = 0;
+    while (i < text.len()) {
+        let c = text.substring(i, i + 1);
+        if (c != "," and c != " " and c != "\t" and c != "\n" and c != "\r") {
+            out = out + c;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+## Whether `text` (from the clipboard) is a number the calculator can take:
+## an optional "-", at most STORED_DIGITS digits and at most one "."; commas
+## and white space are ignored ("1,234.5", " -7\n").
+pub func isPastable(text: string): bool {
+    let clean = cleanPasted(text);
+    var digits = 0;
+    var points = 0;
+    var i = 0;
+    while (i < clean.len()) {
+        let c = clean.substring(i, i + 1);
+        if (c == "-" and i == 0) {
+            # The sign.
+        } else if (c == ".") {
+            points = points + 1;
+        } else if (digitValue(c) >= 0) {
+            digits = digits + 1;
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    let ok = digits > 0 and digits <= STORED_DIGITS and points <= 1;
+    return ok;
+}
+
+## `c` with the number in `text` on the display, ready as an operand (like
+## MR). Unchanged when `text` is not `isPastable` or the display shows
+## "Error".
+pub func pasteNumber(c: Calculator, text: string): Calculator {
+    if (c.error or not isPastable(text)) {
+        return c;
+    }
+    var n = c;
+    n.entry = "";
+    n.value = normalize(parseEntry(cleanPasted(text)));
+    if (n.value == 0.0) {
+        n.value = 0.0;
+    }
+    n.operand_ready = true;
+    return n;
+}
+
+## The state after pressing each key of `keys` in turn.
+pub func pressAll(c: Calculator, keys: list[string]): Calculator {
+    var n = c;
+    for (key in keys) {
+        n = press(n, key);
+    }
+    return n;
+}

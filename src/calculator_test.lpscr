@@ -1,0 +1,200 @@
+@mode(host.scripted)
+
+# Tests of the calculator state machine: each test presses keys and checks
+# the display (and the clear key's title, the pending operator, the memory).
+#   loup test --strict src
+
+from calculator import (Calculator, newCalculator, press, pressAll, displayText, displayValue,
+    clearTitle, pendingSymbol, operatorSymbol, isKey, isPastable, pasteNumber);
+from debug.assert import (expect, expectEq, expectThrows);
+
+## The display after pressing `keys` on a fresh calculator.
+func show(keys: list[string]): string {
+    let c = pressAll(newCalculator(), keys);
+    let text = displayText(c);
+    return text;
+}
+
+## The display after each key of `keys`, joined with " | ".
+func trace(keys: list[string]): string {
+    var c = newCalculator();
+    var shown: list[string] = [];
+    for (key in keys) {
+        c = press(c, key);
+        shown.push(displayText(c));
+    }
+    let text = shown.join(" | ");
+    return text;
+}
+
+func test_starts_at_zero(): void {
+    let c = newCalculator();
+    expectEq(displayText(c), "0", "display");
+    expectEq(clearTitle(c), "AC", "clear key");
+    expectEq(pendingSymbol(c), "", "nothing pending");
+    expect(not c.has_memory, "memory empty");
+}
+
+func test_typing_digits_and_point(): void {
+    expectEq(trace(["1", "2", ".", "5", "0"]), "1 | 12 | 12. | 12.5 | 12.50", "typed as typed");
+    expectEq(show([".", "5"]), "0.5", "a leading point");
+    expectEq(show(["0", "0", "7"]), "7", "no leading zeros");
+    expectEq(show(["1", ".", ".", "2", "."]), "1.2", "one point only");
+    expectEq(show(["1", "2", "3", "4", "5", "6", "7"]), "1,234,567", "grouped while typing");
+}
+
+func test_entry_is_limited_to_twelve_digits(): void {
+    let keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "1", "2", "3", "4"];
+    expectEq(show(keys), "123,456,789,012", "the 13th and 14th digits are ignored");
+}
+
+func test_basic_operations(): void {
+    expectEq(show(["1", "2", ".", "5", "*", "4", "="]), "50", "12.5 × 4");
+    expectEq(show(["7", "+", "8", "="]), "15", "7 + 8");
+    expectEq(show(["3", "-", "1", "0", "="]), "-7", "3 − 10");
+    expectEq(show(["9", "/", "4", "="]), "2.25", "9 ÷ 4");
+    expectEq(show(["0", ".", "1", "+", "0", ".", "2", "="]), "0.3", "no float noise");
+}
+
+func test_chained_operations_are_immediate(): void {
+    expectEq(trace(["2", "+", "3", "*", "4", "="]), "2 | 2 | 3 | 5 | 4 | 20", "(2 + 3) × 4");
+    expectEq(show(["1", "/", "3", "*", "3", "="]), "1", "1 ÷ 3 × 3");
+    expectEq(show(["1", "0", "-", "2", "-", "3", "="]), "5", "10 − 2 − 3");
+}
+
+func test_operator_can_be_changed(): void {
+    let c = pressAll(newCalculator(), ["8", "+", "*"]);
+    expectEq(pendingSymbol(c), "×", "the last operator wins");
+    expectEq(displayText(pressAll(c, ["2", "="])), "16", "8 × 2");
+}
+
+func test_repeated_equals(): void {
+    expectEq(trace(["2", "+", "3", "=", "=", "="]), "2 | 2 | 3 | 5 | 8 | 11", "+3 repeated");
+    expectEq(trace(["2", "*", "3", "=", "="]), "2 | 2 | 3 | 6 | 18", "×3 repeated");
+    expectEq(show(["2", "+", "3", "=", "1", "0", "="]), "13", "a new number takes the last operation");
+    expectEq(show(["5", "+", "="]), "10", "the display is the missing operand");
+    expectEq(show(["4", "="]), "4", "= with nothing pending");
+}
+
+func test_division_by_zero_is_an_error(): void {
+    let c = pressAll(newCalculator(), ["7", "/", "0", "="]);
+    expectEq(displayText(c), "Error", "7 ÷ 0");
+    expect(c.error, "error state");
+    expectEq(clearTitle(c), "AC", "the clear key clears all");
+    let still = pressAll(c, ["5", "+", "=", "%", "+/-", "back", "MR", "."]);
+    expectEq(displayText(still), "Error", "every other key is ignored");
+    let cleared = press(still, "clear");
+    expectEq(displayText(cleared), "0", "cleared");
+    expectEq(displayText(pressAll(cleared, ["6", "*", "7", "="])), "42", "works again");
+    expectEq(show(["0", "/", "0", "="]), "Error", "0 ÷ 0");
+    expectEq(show(["5", "/", "0", "+"]), "Error", "the error shows when chaining too");
+}
+
+func test_overflow_is_an_error(): void {
+    var c = pressAll(newCalculator(), ["9", "9", "9", "9", "9", "9", "9", "9", "9", "9", "9", "9", "*"]);
+    var i = 0;
+    while (i < 30) {
+        c = press(c, "=");
+        i = i + 1;
+    }
+    expectEq(displayText(c), "Error", "repeated squaring overflows");
+}
+
+func test_clear_entry_then_all(): void {
+    let typed = pressAll(newCalculator(), ["5", "+", "3"]);
+    expectEq(clearTitle(typed), "C", "while typing");
+    let entry_cleared = press(typed, "clear");
+    expectEq(displayText(entry_cleared), "0", "entry cleared");
+    expectEq(pendingSymbol(entry_cleared), "+", "the operation stays");
+    expectEq(clearTitle(entry_cleared), "AC", "then all");
+    expectEq(displayText(pressAll(entry_cleared, ["2", "="])), "7", "5 + 2");
+    let all_cleared = press(entry_cleared, "clear");
+    expectEq(pendingSymbol(all_cleared), "", "nothing pending after AC");
+    expectEq(displayText(pressAll(all_cleared, ["2", "="])), "2", "the 5 is gone");
+}
+
+func test_backspace(): void {
+    expectEq(trace(["1", "2", "3", "back", "back"]), "1 | 12 | 123 | 12 | 1", "deletes digits");
+    expectEq(show(["7", "back"]), "0", "the last digit leaves 0");
+    expectEq(show(["4", "+/-", "back"]), "0", "no lone minus");
+    expectEq(show(["1", ".", "back", "5"]), "15", "deletes the point");
+    expectEq(show(["2", "+", "3", "=", "back"]), "5", "a result is not edited");
+}
+
+func test_sign_change(): void {
+    expectEq(trace(["5", "+/-", "+/-"]), "5 | -5 | 5", "toggles while typing");
+    expectEq(show(["5", "+/-", "1"]), "-51", "typing continues");
+    expectEq(show(["2", "+", "3", "=", "+/-"]), "-5", "negates a result");
+    expectEq(trace(["9", "-", "+/-", "4", "="]), "9 | 9 | -0 | -4 | 13", "a negative operand");
+    expectEq(show(["+/-"]), "0", "zero stays 0");
+}
+
+func test_percent(): void {
+    expectEq(show(["5", "0", "%"]), "0.5", "on its own: ÷ 100");
+    expectEq(trace(["5", "0", "+", "1", "0", "%", "="]), "5 | 50 | 50 | 1 | 10 | 5 | 55", "50 + 10%");
+    expectEq(show(["2", "0", "0", "-", "1", "5", "%", "="]), "170", "200 − 15%");
+    expectEq(show(["8", "0", "*", "2", "5", "%", "="]), "20", "80 × 25%");
+    expectEq(show(["2", "%", "%"]), "0.0002", "twice");
+}
+
+func test_memory(): void {
+    var c = pressAll(newCalculator(), ["1", "2", "M+"]);
+    expect(c.has_memory, "stored");
+    expectEq(c.memory, 12.0, "memory 12");
+    expectEq(displayText(c), "12", "the display keeps the number");
+    c = pressAll(c, ["3", "M+"]);
+    expectEq(c.memory, 15.0, "the next digit started a new number: 12 + 3");
+    c = pressAll(c, ["5", "M-"]);
+    expectEq(c.memory, 10.0, "15 − 5");
+    c = pressAll(c, ["clear", "clear", "MR"]);
+    expectEq(displayText(c), "10", "recalled after AC");
+    c = pressAll(c, ["*", "MR", "="]);
+    expectEq(displayText(c), "100", "MR as the right operand");
+    c = press(c, "MC");
+    expect(not c.has_memory, "cleared");
+    expectEq(displayText(press(c, "MR")), "0", "an empty memory recalls 0");
+}
+
+func test_memory_survives_errors_and_clear(): void {
+    let c = pressAll(newCalculator(), ["4", "M+", "1", "/", "0", "=", "clear"]);
+    expect(c.has_memory, "kept through the error");
+    expectEq(displayText(press(c, "MR")), "4", "recalled");
+}
+
+func test_display_value_and_symbols(): void {
+    let c = pressAll(newCalculator(), ["1", "2", ".", "5"]);
+    expectEq(displayValue(c), 12.5, "the typed value");
+    expectEq(operatorSymbol("-"), "−", "minus sign");
+    expectEq(operatorSymbol("/"), "÷", "division sign");
+    expectEq(operatorSymbol("="), "", "not an operator");
+}
+
+func test_unknown_keys_throw(): void {
+    expect(isKey("7") and isKey("M+") and isKey("clear"), "known keys");
+    expect(not isKey("x"), "unknown key");
+    expectThrows(func(): void { press(newCalculator(), "sqrt"); }, "press refuses it");
+}
+
+func test_pastable_text(): void {
+    expect(isPastable("1234.5"), "a decimal");
+    expect(isPastable(" -1,234.5\n"), "grouping, a sign and white space");
+    expect(isPastable("123456789012345"), "fifteen digits");
+    expect(not isPastable("1234567890123456"), "sixteen digits");
+    expect(not isPastable("1.2.3"), "two points");
+    expect(not isPastable("-"), "no digits");
+    expect(not isPastable("12-3"), "a minus inside");
+    expect(not isPastable("not a number"), "words");
+}
+
+func test_paste_number(): void {
+    var c = pasteNumber(newCalculator(), "-0.75");
+    expectEq(displayText(c), "-0.75", "pasted");
+    expectEq(clearTitle(c), "AC", "a pasted number is not being typed");
+    c = pressAll(c, ["*", "4", "="]);
+    expectEq(displayText(c), "-3", "used in a calculation");
+    let typed = pressAll(newCalculator(), ["8", "+"]);
+    expectEq(displayText(pressAll(pasteNumber(typed, "1,000"), ["="])), "1,008", "as the right operand");
+    expectEq(displayText(pasteNumber(c, "abc")), "-3", "not a number: unchanged");
+    let failed = pressAll(newCalculator(), ["1", "/", "0", "="]);
+    expectEq(displayText(pasteNumber(failed, "5")), "Error", "not while showing Error");
+}

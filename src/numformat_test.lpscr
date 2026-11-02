@@ -1,0 +1,94 @@
+@mode(host.scripted)
+
+# Tests of numformat: rounding, result and entry formatting, entry parsing.
+#   loup test --strict src
+
+from numformat import (normalize, isFinite, roundSignificant, formatNumber, formatEntry,
+    parseEntry, groupThousands, digitCount, digitValue);
+from debug.assert import (expect, expectEq, expectThrows);
+
+func test_float_noise_is_rounded_away(): void {
+    let noisy = 0.1 + 0.2;
+    expect(noisy != 0.3, "the raw sum carries float noise");
+    expectEq(normalize(noisy), 0.3, "normalized to the double of 0.3");
+    expectEq(formatNumber(noisy), "0.3", "shown as 0.3");
+    expectEq(normalize(0.3 - normalize(0.1 + 0.2)), 0.0, "0.3 - (0.1 + 0.2) is 0");
+}
+
+func test_normalize_keeps_exact_values(): void {
+    expectEq(normalize(0.0), 0.0, "zero");
+    expectEq(normalize(50.0), 50.0, "an integer");
+    expectEq(normalize(-12.5), -12.5, "a negative half");
+    expectEq(normalize(123456789012345.0), 123456789012345.0, "15 digits");
+}
+
+func test_round_significant(): void {
+    let r = roundSignificant(123.456, 4);
+    expectEq(r.mantissa, 1235, "rounded half up");
+    expectEq(r.exponent, 2, "first digit is hundreds");
+    let carry = roundSignificant(9.9996, 4);
+    expectEq(carry.mantissa, 1000, "the carry adds a digit");
+    expectEq(carry.exponent, 1, "and raises the exponent");
+    let small = roundSignificant(0.000123, 3);
+    expectEq(small.mantissa, 123, "small mantissa");
+    expectEq(small.exponent, -4, "small exponent");
+}
+
+func test_format_integers_and_grouping(): void {
+    expectEq(formatNumber(0.0), "0", "zero");
+    expectEq(formatNumber(7.0), "7", "one digit");
+    expectEq(formatNumber(1234.0), "1,234", "thousands");
+    expectEq(formatNumber(-1234567.0), "-1,234,567", "millions, negative");
+    expectEq(formatNumber(999999999999.0), "999,999,999,999", "the largest plain integer");
+    expectEq(groupThousands("123"), "123", "no comma for three digits");
+    expectEq(groupThousands("1234567890"), "1,234,567,890", "three commas");
+}
+
+func test_format_fractions(): void {
+    expectEq(formatNumber(12.5), "12.5", "no trailing zeros");
+    expectEq(formatNumber(1.0 / 3.0), "0.333333333333", "12 significant digits");
+    expectEq(formatNumber(2.0 / 3.0), "0.666666666667", "rounded last digit");
+    expectEq(formatNumber(0.999999999999999), "1", "rounds up to 1");
+    expectEq(formatNumber(1234.5678), "1,234.5678", "grouped whole part");
+    expectEq(formatNumber(0.000123456789), "0.000123456789", "small, plain");
+    expectEq(formatNumber(-0.25), "-0.25", "negative fraction");
+}
+
+func test_format_scientific(): void {
+    expectEq(formatNumber(1000000000000.0), "1e12", "10^12 is scientific");
+    expectEq(formatNumber(123456789012345.0), "1.23456789012e14", "12 significant digits");
+    expectEq(formatNumber(120000000000000.0), "1.2e14", "trailing zeros dropped");
+    expectEq(formatNumber(999998000001000.0), "9.99998000001e14", "the 12th digit is kept");
+    expectEq(formatNumber(1.0 / 3000000.0), "3.33333333333e-7", "small magnitude");
+    expectEq(formatNumber(-2.5e100), "-2.5e100", "huge negative");
+    expectEq(formatNumber(1.0e308 * 10.0), "Error", "infinity");
+}
+
+func test_is_finite(): void {
+    expect(isFinite(1.5), "an ordinary number");
+    expect(not isFinite(1.0 / 0.0), "infinity");
+    expect(not isFinite(0.0 / 0.0), "NaN");
+}
+
+func test_format_entry(): void {
+    expectEq(formatEntry("0."), "0.", "a trailing point stays");
+    expectEq(formatEntry("12.50"), "12.50", "typed zeros stay");
+    expectEq(formatEntry("-1234567.8"), "-1,234,567.8", "grouped, negative");
+    expectEq(formatEntry("-0"), "-0", "negative zero while typing");
+}
+
+func test_parse_entry(): void {
+    expectEq(parseEntry("12.5"), 12.5, "decimal");
+    expectEq(parseEntry("-0.75"), -0.75, "negative");
+    expectEq(parseEntry("0."), 0.0, "a bare point");
+    expectEq(parseEntry("0.1"), 0.1, "the double nearest 0.1");
+    expectEq(parseEntry("999999999999"), 999999999999.0, "twelve digits");
+    expectThrows(func(): void { parseEntry("1.2.3"); }, "two points");
+    expectThrows(func(): void { parseEntry("12a"); }, "a letter");
+}
+
+func test_digits(): void {
+    expectEq(digitCount("-12.50"), 4, "sign and point are not digits");
+    expectEq(digitValue("7"), 7, "a digit");
+    expectEq(digitValue("x"), -1, "not a digit");
+}
